@@ -18,10 +18,10 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 # =========================
 # PAGE
 # =========================
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
-st.set_page_config(page_title="📈 Stock Analyst Agent", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Stock Analyst Agent", page_icon="📈", layout="wide")
 st.title("📈 Stock Analyst Agent (Real Data + Gemini)")
 st.caption("Enter a company name (e.g., Apple, Microsoft, Reliance). I’ll find the ticker, fetch data, and Gemini will recommend BUY / HOLD / SELL.")
 
@@ -77,15 +77,25 @@ _init_state()
 # =========================
 # Data / Indicator Helpers
 # =========================
+# Trading-day windows for the price chart. Fetch covers the longest window.
+LOOKBACK_BARS = {
+    "3mo": 63,
+    "6mo": 126,
+    "1y": 252,
+    "2y": 504,
+    "3y": 756,
+}
+
+
 def fetch_stock_data(symbol: str) -> Dict[str, Any]:
     """
-    Pull price history (1y daily), fast info, and basic financial ratios if available.
+    Pull price history (3y daily), fast info, and basic financial ratios if available.
     """
     tk = yf.Ticker(symbol)
 
-    # Price history
+    # Price history: 3 years plus a buffer so the 3y window has a full set of bars.
     end = datetime.utcnow()
-    start = end - timedelta(days=365 + 30)  # little buffer
+    start = end - timedelta(days=365 * 3 + 45)
     hist = tk.history(start=start.date(), end=end.date(), interval="1d", auto_adjust=True)
 
     # Fast info (robust vs legacy .info)
@@ -350,7 +360,7 @@ with col[0]:
     company = st.text_input("Company name", value="", placeholder="e.g., Apple, Microsoft, Reliance")
 
 with col[1]:
-    lookback = st.selectbox("Price lookback", ["1y", "6mo", "3mo"], index=0)
+    lookback = st.selectbox("Price lookback", ["3y", "2y", "1y", "6mo", "3mo"], index=2)
 
 with col[2]:
     run_btn = st.button(
@@ -405,12 +415,8 @@ if st.session_state.analyze_now and same_query and st.session_state.selected_sym
                 st.error("No price data found for this symbol.")
             else:
                 # Trim lookback for display
-                if lookback == "6mo":
-                    hist_disp = hist.tail(126)  # ~126 trading days
-                elif lookback == "3mo":
-                    hist_disp = hist.tail(63)
-                else:
-                    hist_disp = hist
+                bars = LOOKBACK_BARS.get(lookback, len(hist))
+                hist_disp = hist.tail(bars)
 
                 inds = compute_indicators(hist)
                 fins = extract_fundamentals(fast)
