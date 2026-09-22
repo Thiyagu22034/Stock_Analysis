@@ -94,9 +94,10 @@ def fetch_stock_data(symbol: str) -> Dict[str, Any]:
     """
     tk = yf.Ticker(symbol)
 
-    # Price history: 3 years plus a buffer so the 3y window has a full set of bars.
-    end = datetime.utcnow()
-    start = end - timedelta(days=365 * 3 + 45)
+    # Price history: 3 years plus a buffer. Yahoo treats `end` as exclusive,
+    # so the end date is two days ahead and today's session is included.
+    end = datetime.utcnow() + timedelta(days=2)
+    start = datetime.utcnow() - timedelta(days=365 * 3 + 45)
     hist = tk.history(start=start.date(), end=end.date(), interval="1d", auto_adjust=True)
 
     # Fast info (robust vs legacy .info)
@@ -121,7 +122,68 @@ def fetch_stock_data(symbol: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    return {"hist": hist, "fast": fast, "fin": fin}
+    hist, quote = _merge_live_quote(hist, fast)
+    return {"hist": hist, "fast": fast, "fin": fin, "quote": quote}
+
+
+def _quote_number(fast, *names):
+    if not fast:
+        return None
+    for name in names:
+        value = None
+        try:
+            value = fast[name]
+        except Exception:
+            value = getattr(fast, name, None)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number) and number > 0:
+            return number
+    return None
+
+
+def _merge_live_quote(hist: pd.DataFrame, fast) -> tuple:
+    """
+    Use the live quote Groww shows when the daily bar is still the previous close.
+    """
+    live = _quote_number(fast, "lastPrice", "last_price")
+    previous = _quote_number(fast, "previousClose", "previous_close", "regularMarketPreviousClose")
+    info = {"today_price": live, "previous_close": previous}
+    if hist is None or hist.empty or live is None:
+        return hist, info
+
+    today = (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
+    last_day = _bar_date(hist.index[-1])
+    last_close = float(hist["Close"].iloc[-1])
+    hist = hist.copy()
+    if last_day >= today:
+        if abs(live - last_close) / last_close > 0.001:
+            hist.iloc[-1, hist.columns.get_loc("Close")] = live
+            if "High" in hist.columns:
+                hist.iloc[-1, hist.columns.get_loc("High")] = max(float(hist["High"].iloc[-1]), live)
+            if "Low" in hist.columns:
+                hist.iloc[-1, hist.columns.get_loc("Low")] = min(float(hist["Low"].iloc[-1]), live)
+        return hist, info
+
+    ts = pd.Timestamp(today)
+    if getattr(hist.index, "tz", None) is not None:
+        ts = ts.tz_localize(hist.index.tz)
+    row = {col: np.nan for col in hist.columns}
+    row["Close"] = live
+    if "Open" in row:
+        row["Open"] = previous if previous else live
+    if "High" in row:
+        row["High"] = max(live, previous or live)
+    if "Low" in row:
+        row["Low"] = min(live, previous or live)
+    volume = _quote_number(fast, "lastVolume", "last_volume")
+    if "Volume" in row and volume:
+        row["Volume"] = volume
+    extra = pd.DataFrame([row], index=pd.DatetimeIndex([ts]))
+    hist = pd.concat([hist, extra])
+    return hist, info
 
 
 def compute_indicators(hist: pd.DataFrame) -> Dict[str, Any]:
@@ -969,6 +1031,7 @@ if st.session_state.analyze_now and same_query and st.session_state.selected_sym
             data = fetch_stock_data(ticker)
             hist = data["hist"]
             fast = data["fast"]
+            quote = data.get("quote") or {}
 
             if hist is None or hist.empty:
                 st.error("No price data found for this symbol.")
@@ -1007,6 +1070,19 @@ if st.session_state.analyze_now and same_query and st.session_state.selected_sym
                     st.error("Downfall alert for " + company_name + " (" + ticker + ").")
                     for reason in news_view["reasons"]:
                         st.write("- " + reason)
+
+                today_price = quote.get("today_price")
+                previous_close = quote.get("previous_close")
+                if today_price:
+                    change = None
+                    if previous_close:
+                        change = f"{(today_price / previous_close - 1) * 100:+.2f}% from previous close {previous_close:,.2f}"
+                    st.metric("Today's price", f"{today_price:,.2f}", delta=change, border=True)
+                    if previous_close and abs(today_price - previous_close) >= 0.05:
+                        st.caption(
+                            f"This matches the live price on Groww. "
+                            f"The previous close was {previous_close:,.2f}, which is the last completed session."
+                        )
 
                 st.subheader(f"{company_name} ({ticker}) – Market outlook")
                 if outlook.get("error"):
