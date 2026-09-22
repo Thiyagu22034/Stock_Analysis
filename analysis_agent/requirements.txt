@@ -1,0 +1,7 @@
+numpy
+pandas
+yfinance
+streamlit
+ta
+autogen-agentchat
+autogen-ext[openai]
