@@ -1,4 +1,5 @@
 import json
+import re
 import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
@@ -424,6 +425,314 @@ def forecast_outlook(hist: pd.DataFrame, indicators: Dict[str, Any]) -> Dict[str
     }
 
 
+def daily_market_read(hist: pd.DataFrame, bars: int) -> pd.DataFrame:
+    """
+    One row per session. The day read combines that day's move, its place
+    versus the 20-day average, and the MACD histogram.
+    """
+    close = hist["Close"].dropna().astype(float)
+    if close.empty:
+        return pd.DataFrame()
+
+    volume = hist["Volume"].reindex(close.index).astype(float) if "Volume" in hist.columns else None
+    sma20 = close.rolling(20).mean()
+    rsi = RSIIndicator(close, window=14).rsi()
+    macd_hist = MACD(close, window_slow=26, window_fast=12, window_sign=9).macd_diff()
+    change = close.pct_change()
+    versus_sma = close / sma20 - 1.0
+    if volume is not None:
+        vol_vs = volume / volume.rolling(20).mean()
+    else:
+        vol_vs = pd.Series(np.nan, index=close.index)
+
+    change_vote = pd.Series(
+        np.where(change > 0.001, 1.0, np.where(change < -0.001, -1.0, 0.0)),
+        index=close.index,
+    ).where(change.notna())
+    sma_vote = pd.Series(np.where(close > sma20, 1.0, -1.0), index=close.index).where(sma20.notna())
+    macd_vote = pd.Series(np.where(macd_hist > 0, 1.0, -1.0), index=close.index).where(macd_hist.notna())
+    score = pd.concat([change_vote, sma_vote, macd_vote], axis=1).mean(axis=1, skipna=True)
+    day_read = pd.Series(
+        np.where(score >= 0.34, "Upward", np.where(score <= -0.34, "Downward", "Sideways")),
+        index=close.index,
+    ).where(score.notna(), "Sideways")
+
+    frame = pd.DataFrame({
+        "Date": [_bar_date(ts) for ts in close.index],
+        "Close": close.to_numpy(),
+        "Change": change.to_numpy(),
+        "RSI": rsi.to_numpy(),
+        "MACD": macd_hist.to_numpy(),
+        "Vs 20-day average": versus_sma.to_numpy(),
+        "Volume vs average": vol_vs.to_numpy(),
+        "Day read": day_read.to_numpy(),
+    })
+    return frame.tail(max(int(bars), 1)).iloc[::-1].reset_index(drop=True)
+
+
+def projected_sessions(outlook: Dict[str, Any]) -> pd.DataFrame:
+    """Trading days from the next session through the expected high."""
+    if outlook.get("error") or not outlook.get("high_date"):
+        return pd.DataFrame()
+
+    start = datetime.strptime(outlook["as_of"], "%Y-%m-%d").date()
+    end = datetime.strptime(outlook["high_date"], "%Y-%m-%d").date()
+    days = pd.bdate_range(start + timedelta(days=1), end)
+    if len(days) == 0:
+        days = pd.DatetimeIndex([pd.Timestamp(end)])
+
+    last = float(outlook["last_price"])
+    high = float(outlook["high_price"])
+    prices = np.linspace(last, high, len(days) + 1)[1:]
+    previous = np.concatenate([[last], prices[:-1]])
+    change = np.where(previous != 0, prices / previous - 1.0, 0.0)
+    reads = []
+    for i, (price, prior) in enumerate(zip(prices, previous)):
+        if i == len(prices) - 1:
+            reads.append("Expected high")
+        elif price > prior:
+            reads.append("Upward")
+        elif price < prior:
+            reads.append("Downward")
+        else:
+            reads.append("Sideways")
+
+    return pd.DataFrame({
+        "Date": [ts.date() for ts in days],
+        "Estimated close": np.round(prices, 2),
+        "Change": change,
+        "Day read": reads,
+    })
+
+
+NEWS_WINDOW_DAYS = 15
+PREDICT_SESSIONS = 15
+
+_POSITIVE_WORDS = {
+    "upgrade", "upgraded", "surge", "surged", "surges", "rally", "rallied",
+    "record", "beat", "beats", "beaten", "bullish", "outperform", "approval",
+    "approved", "breakthrough", "buyback", "dividend", "expansion", "partnership",
+    "profit", "profits", "growth", "strong", "gain", "gains", "raised", "raises",
+}
+_NEGATIVE_WORDS = {
+    "downgrade", "downgraded", "plunge", "plunged", "plunges", "slump", "slumped",
+    "lawsuit", "investigation", "probe", "fraud", "recall", "layoff", "layoffs",
+    "bankruptcy", "default", "warning", "miss", "misses", "missed", "underperform",
+    "bearish", "decline", "declined", "declines", "crash", "crashed", "halt",
+    "halted", "penalty", "selloff", "tumble", "tumbled", "disappoint",
+    "disappointed", "loss", "losses", "weak", "weakness", "lowered", "lowers",
+}
+_POSITIVE_PHRASES = ("price target raised", "beats estimates", "beat estimates", "raises guidance", "share buyback")
+_NEGATIVE_PHRASES = ("guidance cut", "price target cut", "job cuts", "profit warning", "sell-off")
+
+
+def _news_text_score(text: str) -> float:
+    lowered = (text or "").lower()
+    if not lowered.strip():
+        return 0.0
+    pos = sum(lowered.count(phrase) for phrase in _POSITIVE_PHRASES)
+    neg = sum(lowered.count(phrase) for phrase in _NEGATIVE_PHRASES)
+    for word in re.findall(r"[a-z']+", lowered):
+        if word in _POSITIVE_WORDS:
+            pos += 1
+        elif word in _NEGATIVE_WORDS:
+            neg += 1
+    if pos == neg == 0:
+        return 0.0
+    return (pos - neg) / (pos + neg)
+
+
+def _tone_label(score: float) -> str:
+    if score > 0.05:
+        return "Positive"
+    if score < -0.05:
+        return "Negative"
+    return "Neutral"
+
+
+def _parse_news_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    content = item.get("content") if isinstance(item.get("content"), dict) else item
+    title = str(content.get("title") or "").strip()
+    if not title:
+        return None
+    summary = str(content.get("summary") or content.get("description") or "").strip()
+    provider = content.get("provider") if isinstance(content.get("provider"), dict) else {}
+    source = str(provider.get("displayName") or content.get("publisher") or "").strip()
+    url = ""
+    for key in ("canonicalUrl", "clickThroughUrl"):
+        block = content.get(key)
+        if isinstance(block, dict) and block.get("url"):
+            url = str(block["url"])
+            break
+    if not url:
+        url = str(content.get("link") or "")
+    published = content.get("pubDate") or content.get("displayTime")
+    if published is None and content.get("providerPublishTime"):
+        published = datetime.utcfromtimestamp(int(content["providerPublishTime"])).isoformat() + "Z"
+    when = pd.to_datetime(published, utc=True, errors="coerce")
+    if pd.isna(when):
+        return None
+    headline_score = 0.7 * _news_text_score(title) + 0.3 * _news_text_score(summary)
+    return {
+        "published": when,
+        "Date": when.tz_convert("UTC").date(),
+        "Source": source or "Yahoo Finance",
+        "Headline": title,
+        "Tone": _tone_label(headline_score),
+        "score": float(headline_score),
+        "Link": url,
+    }
+
+
+def fetch_company_news(symbol: str, days: int = NEWS_WINDOW_DAYS) -> list:
+    """Headlines for this symbol from the past `days` calendar days."""
+    tk = yf.Ticker(symbol)
+    raw = []
+    try:
+        raw.extend(tk.get_news(count=40, tab="all") or [])
+    except TypeError:
+        raw.extend(tk.news or [])
+    except Exception:
+        pass
+    try:
+        raw.extend(yf.Search(symbol, news_count=20).news or [])
+    except Exception:
+        pass
+
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+    parsed = []
+    seen = set()
+    for item in raw:
+        row = _parse_news_item(item)
+        if row is None or row["published"] < cutoff:
+            continue
+        key = row["Headline"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed.append(row)
+    parsed.sort(key=lambda row: row["published"], reverse=True)
+    return parsed
+
+
+def analyze_recent_news(symbol: str, hist: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Score the past 15 days of headlines and project the next 15 sessions.
+    A downfall is a sharp recent drop, a clearly negative news tone, or a
+    forecast that loses ground over those sessions.
+    """
+    articles = fetch_company_news(symbol)
+    scores = [row["score"] for row in articles]
+    news_score = float(np.mean(scores)) if scores else 0.0
+    positive = sum(1 for row in articles if row["Tone"] == "Positive")
+    negative = sum(1 for row in articles if row["Tone"] == "Negative")
+    neutral = len(articles) - positive - negative
+    if news_score > 0.05:
+        tone = "Positive"
+    elif news_score < -0.05:
+        tone = "Negative"
+    elif articles:
+        tone = "Mixed"
+    else:
+        tone = "No headlines"
+
+    close = hist["Close"].dropna().astype(float) if hist is not None else pd.Series(dtype=float)
+    ret_1 = ret_5 = ret_15 = drift = typical = 0.0
+    as_of = datetime.utcnow().date()
+    last_price = None
+    if len(close) >= 2:
+        as_of = _bar_date(close.index[-1])
+        last_price = float(close.iloc[-1])
+        changes = close.pct_change().dropna()
+        ret_1 = float(changes.iloc[-1])
+        ret_5 = float(close.iloc[-1] / close.iloc[-6] - 1.0) if len(close) > 6 else ret_1
+        ret_15 = float(close.iloc[-1] / close.iloc[-16] - 1.0) if len(close) > 16 else ret_5
+        recent = changes.tail(15)
+        drift = float(recent.mean()) if len(recent) else 0.0
+        typical = float(recent.std()) if len(recent) else 0.01
+        if not np.isfinite(typical) or typical <= 0:
+            typical = 0.01
+
+    reasons = []
+    if ret_1 <= -0.02:
+        reasons.append(f"The last session fell {abs(ret_1) * 100:.1f}%.")
+    if ret_5 <= -0.025:
+        reasons.append(f"The past 5 sessions are down {abs(ret_5) * 100:.1f}%.")
+    if ret_15 <= -0.04:
+        reasons.append(f"The past 15 sessions are down {abs(ret_15) * 100:.1f}%.")
+    if articles and negative >= max(positive + 2, 3) and news_score <= -0.2:
+        reasons.append(
+            f"{negative} of {len(articles)} headlines from the past 15 days read negative."
+        )
+
+    forecast = pd.DataFrame()
+    predicted_return = 0.0
+    if last_price is not None:
+        days = pd.bdate_range(as_of + timedelta(days=1), periods=PREDICT_SESSIONS)
+        price = last_price
+        rows = []
+        for i, day in enumerate(days):
+            fade = 0.82 ** i
+            step = 0.55 * drift + 0.45 * news_score * typical * fade
+            step = float(np.clip(step, -0.025, 0.025))
+            nxt = price * (1.0 + step)
+            if step > 0.001:
+                read = "Upward"
+            elif step < -0.001:
+                read = "Downward"
+            else:
+                read = "Sideways"
+            rows.append({
+                "Date": day.date(),
+                "Estimated close": round(nxt, 2),
+                "Change": step,
+                "Day read": read,
+            })
+            price = nxt
+        forecast = pd.DataFrame(rows)
+        predicted_return = price / last_price - 1.0
+        down_days = sum(1 for row in rows if row["Day read"] == "Downward")
+        if predicted_return <= -0.02:
+            reasons.append(
+                f"The next {PREDICT_SESSIONS} sessions are estimated down {abs(predicted_return) * 100:.1f}%."
+            )
+        elif down_days >= 10 and ret_15 < 0:
+            reasons.append(
+                f"{down_days} of the next {PREDICT_SESSIONS} sessions are estimated downward."
+            )
+
+    news_frame = pd.DataFrame([
+        {
+            "Date": row["Date"],
+            "Source": row["Source"],
+            "Tone": row["Tone"],
+            "Headline": row["Headline"],
+            "Link": row["Link"],
+        }
+        for row in articles
+    ])
+
+    return {
+        "articles": [
+            {"date": row["Date"].isoformat(), "title": row["Headline"], "tone": row["Tone"]}
+            for row in articles[:15]
+        ],
+        "news_frame": news_frame,
+        "forecast": forecast,
+        "headline_count": len(articles),
+        "positive": positive,
+        "negative": negative,
+        "neutral": neutral,
+        "news_score": round(news_score, 2),
+        "tone": tone,
+        "downfall": bool(reasons),
+        "reasons": reasons,
+        "predicted_return_pct": round(predicted_return * 100, 1),
+    }
+
+
 def lookup_companies(query: str) -> list:
     """
     Resolve a company name (or ticker) to equity matches via Yahoo Finance.
@@ -555,7 +864,8 @@ def build_agent(api_key: str) -> AssistantAgent:
         "You are a disciplined equity research assistant. You will be given:\n"
         "1) Technical indicators (RSI, MACD, SMAs, 52w range, volume ratio)\n"
         "2) Fundamental signals (PE, PB, market cap, dividend yield)\n"
-        "3) A computed outlook with direction, expected_high_date, and expected_high_price\n\n"
+        "3) A computed outlook with direction, expected_high_date, and expected_high_price\n"
+        "4) Headlines from the past 15 days, each with a tone, plus a downfall flag\n\n"
         "Output strict JSON with fields:\n"
         "{\n"
         '  "action": "BUY" | "HOLD" | "SELL",\n'
@@ -572,6 +882,8 @@ def build_agent(api_key: str) -> AssistantAgent:
         "- Otherwise HOLD.\n"
         "- Be conservative if data is missing.\n"
         "- If you mention a high date or a direction, use the computed outlook. Do not invent another date.\n"
+        "- Weigh the past 15 days of headlines with the technicals.\n"
+        "- If downfall is true, name that in risks.\n"
         "- JSON only. No markdown, no extra text."
     )
     agent = AssistantAgent(
@@ -668,6 +980,7 @@ if st.session_state.analyze_now and same_query and st.session_state.selected_sym
                 inds = compute_indicators(hist)
                 fins = extract_fundamentals(fast)
                 outlook = forecast_outlook(hist, inds)
+                news_view = analyze_recent_news(ticker, hist)
                 payload = {
                     "company_name": company_name,
                     "symbol": ticker,
@@ -680,7 +993,20 @@ if st.session_state.analyze_now and same_query and st.session_state.selected_sym
                         "expected_high_date": outlook.get("high_date"),
                         "expected_high_price": outlook.get("high_price"),
                     },
+                    "news_15d": {
+                        "headline_count": news_view["headline_count"],
+                        "tone": news_view["tone"],
+                        "downfall": news_view["downfall"],
+                        "reasons": news_view["reasons"],
+                        "headlines": news_view["articles"],
+                    },
                 }
+
+                if news_view["downfall"]:
+                    st.toast(f"Downfall alert for {company_name}")
+                    st.error("Downfall alert for " + company_name + " (" + ticker + ").")
+                    for reason in news_view["reasons"]:
+                        st.write("- " + reason)
 
                 st.subheader(f"{company_name} ({ticker}) – Market outlook")
                 if outlook.get("error"):
@@ -727,6 +1053,50 @@ if st.session_state.analyze_now and same_query and st.session_state.selected_sym
                         "The price is an estimate kept inside the range of similar past rallies."
                     )
 
+                with st.container(border=True):
+                    st.subheader("News, past 15 days")
+                    with st.container(horizontal=True):
+                        st.metric("Headlines", news_view["headline_count"], border=True)
+                        st.metric("Positive", news_view["positive"], border=True)
+                        st.metric("Negative", news_view["negative"], border=True)
+                        st.metric("News tone", news_view["tone"], border=True)
+                    if news_view["news_frame"].empty:
+                        st.info("No headlines were returned for this company in the past 15 days.")
+                    else:
+                        st.dataframe(
+                            news_view["news_frame"],
+                            column_config={
+                                "Date": st.column_config.DateColumn("Date", pinned=True),
+                                "Source": st.column_config.TextColumn("Source"),
+                                "Tone": st.column_config.TextColumn("Tone"),
+                                "Headline": st.column_config.TextColumn("Headline"),
+                                "Link": st.column_config.LinkColumn("Link", display_text="Open"),
+                            },
+                            hide_index=True,
+                            height=320,
+                        )
+
+                forecast = news_view["forecast"]
+                if not forecast.empty:
+                    with st.container(border=True):
+                        st.subheader("Predicted day-to-day performance")
+                        st.caption(
+                            f"Next {len(forecast)} trading days, estimated {news_view['predicted_return_pct']:+.1f}% from the latest close. "
+                            "Each day blends the past 15 sessions of price with the tone of the past 15 days of headlines. "
+                            "The news effect fades on later days."
+                        )
+                        st.dataframe(
+                            forecast,
+                            column_config={
+                                "Date": st.column_config.DateColumn("Date", pinned=True),
+                                "Estimated close": st.column_config.NumberColumn("Estimated close", format="%,.2f"),
+                                "Change": st.column_config.NumberColumn("Change", format="percent"),
+                                "Day read": st.column_config.TextColumn("Day read"),
+                            },
+                            hide_index=True,
+                            height=380,
+                        )
+
                 # Show raw metrics
                 st.subheader(f"{company_name} ({ticker}) – Key Metrics")
                 c1, c2 = st.columns(2)
@@ -749,6 +1119,46 @@ if st.session_state.analyze_now and same_query and st.session_state.selected_sym
                 st.line_chart(chart_close)
                 if not outlook.get("error"):
                     st.caption(f"The last point is the estimated high on {outlook['high_date_label']}, not a traded price.")
+
+                daily = daily_market_read(hist, LOOKBACK_BARS.get(lookback, len(hist)))
+                with st.container(border=True):
+                    st.subheader("Day by day")
+                    st.caption(
+                        f"{len(daily)} sessions in the {lookback} window, newest first. "
+                        "Each day read uses that session's move, its place versus the 20-day average, and MACD."
+                    )
+                    st.dataframe(
+                        daily,
+                        column_config={
+                            "Date": st.column_config.DateColumn("Date", pinned=True),
+                            "Close": st.column_config.NumberColumn("Close", format="%,.2f"),
+                            "Change": st.column_config.NumberColumn("Change", format="percent"),
+                            "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+                            "MACD": st.column_config.NumberColumn("MACD", format="%.3f"),
+                            "Vs 20-day average": st.column_config.NumberColumn("Vs 20-day average", format="percent"),
+                            "Volume vs average": st.column_config.NumberColumn("Volume vs average", format="%.2f"),
+                            "Day read": st.column_config.TextColumn("Day read"),
+                        },
+                        hide_index=True,
+                        height=420,
+                    )
+
+                upcoming = projected_sessions(outlook)
+                if not upcoming.empty:
+                    with st.container(border=True):
+                        st.subheader("Path to the expected high")
+                        st.caption("Estimated closes on each trading day from the next session through the expected high.")
+                        st.dataframe(
+                            upcoming,
+                            column_config={
+                                "Date": st.column_config.DateColumn("Date", pinned=True),
+                                "Estimated close": st.column_config.NumberColumn("Estimated close", format="%,.2f"),
+                                "Change": st.column_config.NumberColumn("Change", format="percent"),
+                                "Day read": st.column_config.TextColumn("Day read"),
+                            },
+                            hide_index=True,
+                            height=320,
+                        )
 
                 # Call agent for decision
                 agent = build_agent(gemini_api_key.strip())
@@ -796,4 +1206,4 @@ if st.session_state.analyze_now and same_query and st.session_state.selected_sym
 
 # Footer / debug
 st.divider()
-st.caption("Data via yfinance. The outlook is a model estimate for education, not financial advice.")
+st.caption("Data and headlines via Yahoo Finance. Outlook, news tone, and day-to-day estimates are for education, not financial advice.")
